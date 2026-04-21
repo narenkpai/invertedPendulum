@@ -32,7 +32,7 @@ FastAccelStepper *stepper = NULL;
 // ======================================================
 
 static const int32_t ENCODER_MAX   = 16384;
-static const int32_t UPRIGHT_COUNT = 3110;
+static const int32_t UPRIGHT_COUNT = 6500;
 
 // Same style as old code
 static const int32_t ENGAGE_WINDOW_COUNTS  = 1400;
