@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -)",
+      "Bash(python3 /Users/narenpai/Desktop/pendulumInverted/tools/compute_lqr_gains.py)"
+    ]
+  }
+}
