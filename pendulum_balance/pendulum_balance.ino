@@ -64,7 +64,27 @@ const float TH_REF_MAX = 0.08f;  // rad (~4.6 deg) cap on the outer-loop lean re
 
 const float ENGAGE_TH  = 0.06f;   // rad (~3.4 deg) upright window to engage
 const float ENGAGE_THD = 0.8f;    // rad/s stillness to engage
-const float ABORT_TH   = 0.45f;   // rad (~20 deg) give up beyond this
+const float ABORT_TH   = 0.35f;   // rad (~20 deg) give up beyond this
+
+// ---- swing-up (velocity-phase energy pumping) ----
+// A velocity-limited cart transfers energy only during its reversals
+// (dE/dt = -u*thd*cos th), so the reversal must happen where |thd| is
+// biggest: as the pendulum passes THROUGH the bottom. vTarget flips sign at
+// each bottom crossing; a taper softens the drive as energy nears target.
+const float SW_ACCEL   = 15.0f;   // m/s^2 reversal sharpness — more = more
+                                  // energy per pass, but stall risk
+const float SW_VMAX    = 0.6f;    // m/s. 12 kHz firmware cap = 0.6 — values
+                                  // above this change NOTHING (silently capped)
+const float SW_VMIN    = 0.30f;   // m/s stroke floor: below this, pivot
+                                  // friction eats the whole dose and E plateaus
+const float SW_KXC     = 5.0f;    // centering: fractional pump-amplitude skew
+                                  // per m off center (phase-preserving)
+const float SW_E_TARGET = 0.5f;   // slight surplus over top-at-rest; the catch
+                                  // window absorbs the extra speed
+const float CATCH_TH   = 0.30f;   // rad (~17 deg): hand off to balance inside this
+const float CATCH_THD  = 3.0f;    // rad/s: ...and below this speed (hot catches
+                                  // allowed only while still rising to the top)
+const uint32_t SW_TIMEOUT_MS = 30000;
 
 const float TRIM_STEP  = 0.00436f; // rad (0.25 deg) per +/- keypress
 const float TRIM_MAX   = 0.30f;    // rad (~17 deg) trim authority
@@ -378,9 +398,10 @@ void home() {
 }
 
 // ================= controller =================
-enum RunState { UNHOMED, IDLE, BALANCE };
+enum RunState { UNHOMED, IDLE, BALANCE, SWINGUP };
 RunState runState = UNHOMED;
 bool paused = false;       // 'k': motor off + auto-engage inhibited, 'l': resume
+uint32_t swingStartMs = 0;
 
 float vCmd = 0.0f;         // commanded cart velocity (m/s)
 float thPrev = 0.0f;
@@ -471,6 +492,82 @@ void controlTick() {
       thdFilt = 0.0f;
       runState = BALANCE;
       Serial.println(F("ENGAGED — let go gently."));
+    }
+    return;
+  }
+
+  if (runState == SWINGUP) {
+    // caught? hand off to the balance controller (vCmd carries over smoothly).
+    // Hot catches (up to CATCH_THD) only while still RISING toward the top —
+    // th*thd <= 0 — so balance starts with the angle shrinking, not growing.
+    if (fabs(th) < CATCH_TH && fabs(thdFilt) < CATCH_THD &&
+        (th * thdFilt <= 0.0f || fabs(thdFilt) < 1.5f)) {
+      runState = BALANCE;
+      Serial.println(F("CAUGHT — balancing."));
+      return;
+    }
+    if (millis() - swingStartMs > SW_TIMEOUT_MS) { disengage(F("swing-up timeout")); return; }
+    if (fabs(x) > xLimit + 0.010f) { disengage(F("ran past soft stop")); return; }
+    if ((tickNum & 0x3F) == 0) {
+      int32_t predicted = mtCenter + (int32_t)(stepCountAtomic() * cal.countsPerStep);
+      if (labs(mtPos - predicted) > MT_CPR) { disengage(F("motor stall detected")); return; }
+    }
+
+    // Energy per unit m*l: 0 at upright rest, -2g hanging at rest
+    float E = 0.5f * PENDULUM_LEFF * thdFilt * thdFilt + 9.81f * (cosf(th) - 1.0f);
+
+    // E is noisy (filtered thd lags at high speed) — smooth it for the servo
+    static float eFilt = 0.0f;
+    if (millis() - swingStartMs < 250) eFilt = E;
+    else                               eFilt += 0.2f * (E - eFilt);
+
+    float vTarget;
+    if (millis() - swingStartMs < 250) {
+      vTarget = 0.7f * SW_VMAX;          // brief starting kick (time-boxed:
+                                         // must NOT refire at swing turning points)
+    } else {
+      // Per-pass energy servo. Each bottom reversal transfers ~2*v*thd_bottom
+      // of energy, and thd_bottom grows large near the top — a fixed taper
+      // overdoses by whole passes and orbits the target in a limit cycle.
+      // Command exactly the v that closes the energy error in one pass:
+      // v = (E_target - E) / (2 * thd_bottom). Sign(-sin th) keeps pumping
+      // valid over the whole circle (dE/dt ~ thd^2*cos^2 >= 0).
+      float arg = 2.0f * (eFilt + 19.62f) / PENDULUM_LEFF;   // thd_bottom^2
+      float thdB = (arg > 4.0f) ? sqrtf(arg) : 2.0f;
+      float vMag = (SW_E_TARGET - eFilt) / (2.0f * thdB);    // <0 = brake
+      // Friction floor: tiny final doses lose entirely to pivot friction and
+      // the swing plateaus short of the top. Keep pumping strokes above
+      // SW_VMIN and let the widened catch absorb the slight surplus.
+      if (eFilt < SW_E_TARGET && vMag < SW_VMIN) vMag = SW_VMIN;
+      if (vMag >  SW_VMAX) vMag =  SW_VMAX;
+      if (vMag < -SW_VMAX) vMag = -SW_VMAX;
+      float base = -vMag * ((sinf(th) >= 0.0f) ? 1.0f : -1.0f);
+      // Centering WITHOUT corrupting reversal phase: an additive velocity
+      // bias shifts where vTarget crosses zero (mistimed reversals REMOVE
+      // energy). Instead scale amplitude: weaker strokes away from center,
+      // stronger strokes toward it — sign flips stay at the bottom crossing.
+      float skew = SW_KXC * x * ((base >= 0.0f) ? 1.0f : -1.0f);
+      if (skew >  0.6f) skew =  0.6f;
+      if (skew < -0.6f) skew = -0.6f;
+      vTarget = base * (1.0f - skew);
+    }
+    if (vTarget >  SW_VMAX) vTarget =  SW_VMAX;
+    if (vTarget < -SW_VMAX) vTarget = -SW_VMAX;
+
+    float dv = vTarget - vCmd;           // slew toward target at SW_ACCEL
+    float dvMax = SW_ACCEL * DT;
+    if (dv >  dvMax) dv =  dvMax;
+    if (dv < -dvMax) dv = -dvMax;
+    vCmd += dv;
+    if (x >=  xLimit && vCmd > 0) vCmd = 0;
+    if (x <= -xLimit && vCmd < 0) vCmd = 0;
+    stepperSetRate(fabs(vCmd) / mPerStep, vCmd > 0);
+
+    if ((tickNum & 0x7F) == 0) {
+      Serial.print(F("swing th ")); Serial.print(th * 57.2958f, 0);
+      Serial.print(F("  thd "));    Serial.print(thdFilt, 1);
+      Serial.print(F("  E "));      Serial.print(E, 1);
+      Serial.print(F("  x "));      Serial.println(x * 1000.0f, 0);
     }
     return;
   }
@@ -572,8 +669,8 @@ void setup() {
   printTrim();
   Serial.println(F("Keys: g=home/start  t=capture upright (IDLE, pendulum held"));
   Serial.println(F("POINTING UP)  +/-=nudge trim 0.25deg  r=reset trim  s=save"));
-  Serial.println(F("trim  c=center cart (IDLE)  k=pause motor  l=unpause"));
-  Serial.println(F("other=e-stop"));
+  Serial.println(F("trim  c=center cart (IDLE)  w=swing-up (IDLE, pendulum"));
+  Serial.println(F("hanging)  k=pause motor  l=unpause  other=e-stop"));
   Serial.println(F("Send 'g' to home and start."));
 }
 
@@ -604,7 +701,7 @@ void loop() {
       Serial.print(F("trim reset. "));
       printTrim();
     } else if (c == 'k') {
-      if (runState == BALANCE) disengage(F("paused with 'k'"));
+      if (runState == BALANCE || runState == SWINGUP) disengage(F("paused with 'k'"));
       paused = true;
       Serial.println(F("PAUSED — motor off, auto-engage inhibited. 'l' resumes."));
     } else if (c == 'l') {
@@ -619,7 +716,22 @@ void loop() {
       thdFilt = 0.0f;
       nextTickUs = micros();         // don't "catch up" ticks missed while moving
       Serial.println(F("Centered (x = 0)."));
-    } else if (runState == BALANCE) {
+    } else if (c == 'w' && runState == IDLE) {
+      if (paused) {
+        Serial.println(F("Unpause first ('l')."));
+      } else {
+        Serial.println(F("Swing-up: centering cart..."));
+        moveToCounts(mtCenter);
+        noInterrupts(); stepCount = 0; interrupts();
+        thPrev = readTheta();
+        thdFilt = 0.0f;
+        vCmd = 0.0f;
+        nextTickUs = micros();
+        swingStartMs = millis();
+        runState = SWINGUP;
+        Serial.println(F("SWING-UP — stand clear."));
+      }
+    } else if (runState == BALANCE || runState == SWINGUP) {
       disengage(F("serial e-stop"));
       return;
     } else if (runState == UNHOMED && c == 'g') {
